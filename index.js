@@ -6,7 +6,7 @@ const cors = require('cors')
 const app = express();
 require('dotenv').config();
 
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
 const port = process.env.PORT;
 const uri = process.env.MONGO_DB_URI;
@@ -36,17 +36,16 @@ async function run() {
     app.post('/api/users/sync', async (req, res) => {
       const user = req.body;
 
-      if (!user?.id) {
-        return res.status(400).send({ message: "User ID is required" });
+      if (!user?.email) {
+        return res.status(400).send({ message: "Email is required" });
       }
 
       const existingUser = await usersCollection.findOne({
-        _id: user.id
+        email: user.email
       });
 
       if (!existingUser) {
         await usersCollection.insertOne({
-          _id: user.id,   // 🔥 IMPORTANT CHANGE
           name: user.name,
           email: user.email,
           avatar: user.avatar,
@@ -68,7 +67,7 @@ async function run() {
       const id = req.params.id;
 
       const user = await usersCollection.findOne({
-        _id: id
+        _id: new ObjectId(id)
       });
 
       res.send(user);
