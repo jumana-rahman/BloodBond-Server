@@ -482,6 +482,25 @@ async function run() {
       }
     );
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEARCH ROUTES  (public)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // GET /api/search/donors?bloodGroup=A+&district=Dhaka&upazila=Dhanmondi
+    app.get("/api/search/donors", async (req, res) => {
+      const { bloodGroup, district, upazila } = req.query;
+      const filter = { role: "donor", status: "active" };
+      if (bloodGroup) filter.bloodGroup = bloodGroup;
+      if (district) filter.district = district;
+      if (upazila) filter.upazila = upazila;
+      const donors = await usersCollection
+        .find(filter, {
+          projection: { name: 1, email: 1, avatar: 1, bloodGroup: 1, district: 1, upazila: 1 },
+        })
+        .toArray();
+      res.json(donors);
+    });
+
     
 
     // ─── Health check ──────────────────────────────────────────────────────────
