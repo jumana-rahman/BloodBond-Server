@@ -501,7 +501,53 @@ async function run() {
       res.json(donors);
     });
 
-    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FUNDING ROUTES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // GET /api/fundings  — private: show all fundings
+    app.get("/api/fundings", verifyToken, async (req, res) => {
+      const fundings = await fundingsCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(fundings);
+    });
+
+    // POST /api/fundings  — save a completed Stripe payment record
+    app.post("/api/fundings", verifyToken, verifyActive, async (req, res) => {
+      const { amount, transactionId } = req.body;
+      const { email } = req.user;
+      const donor = await usersCollection.findOne({ email });
+      const funding = {
+        donorName: donor?.name || "",
+        donorEmail: email,
+        amount: parseFloat(amount),
+        transactionId,
+        createdAt: new Date(),
+      };
+      const result = await fundingsCollection.insertOne(funding);
+      res.status(201).json({ success: true, insertedId: result.insertedId });
+    });
+
+    // POST /api/create-payment-intent  — Stripe: create payment intent
+    // (install: npm install stripe)
+    app.post("/api/create-payment-intent", verifyToken, verifyActive, async (req, res) => {
+      const { amount } = req.body; // amount in BDT (or any currency)
+      if (!amount || amount < 1)
+        return res.status(400).json({ message: "Invalid amount" });
+      try {
+        const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(amount * 100), // convert to cents/paisa
+          currency: "usd", // change to "bdt" if Stripe supports it in your region
+          payment_method_types: ["card"],
+        });
+        res.json({ clientSecret: paymentIntent.client_secret });
+      } catch (err) {
+        res.status(500).json({ message: err.message });
+      }
+    });
 
     // ─── Health check ──────────────────────────────────────────────────────────
     app.get("/", (req, res) => res.send("BloodBond API is running ✅"));
