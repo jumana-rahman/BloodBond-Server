@@ -1,93 +1,197 @@
 const dns = require("dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
-const express = require('express');
-const cors = require('cors')
+const express = require("express");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+require("dotenv").config();
+
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+
 const app = express();
-require('dotenv').config();
-
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-
 const port = process.env.PORT;
 const uri = process.env.MONGO_DB_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-app.use(cors());
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
+// ─── JWT Guard Middleware ─────────────────────────────────────────────────────
 
+// Verifies the Bearer token on every protected route
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized: No token provided" });
+  }
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; 
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "Unauthorized: Invalid or expired token" });
+  }
+};
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+// Only admin can access
+const verifyAdmin = (req, res, next) => {
+  if (req.user?.role !== "admin") {
+    return res.status(403).json({ message: "Forbidden: Admin access only" });
+  }
+  next();
+};
+
+// Admin or Volunteer can access
+const verifyAdminOrVolunteer = (req, res, next) => {
+  if (req.user?.role !== "admin" && req.user?.role !== "volunteer") {
+    return res.status(403).json({ message: "Forbidden: Admin or Volunteer access only" });
+  }
+  next();
+};
+
+// Blocked users cannot mutate data
+const verifyActive = (req, res, next) => {
+  if (req.user?.status === "blocked") {
+    return res.status(403).json({ message: "Your account has been blocked." });
+  }
+  next();
+};
+
+// ─── MongoDB Connection ───────────────────────────────────────────────────────
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
 });
 
 async function run() {
   try {
-    // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
+    await client.db("admin").command({ ping: 1 });
+    console.log("✅ Connected to MongoDB Atlas");
 
-    const database = client.db("bloodbond_db");
-    const usersCollection = database.collection("users");
+    const db = client.db("bloodbond_db");
+    const usersCollection = db.collection("users");
+    const donationRequestsCollection = db.collection("donationRequests");
+    const fundingsCollection = db.collection("fundings");
 
-    app.post('/api/users/sync', async (req, res) => {
-      const user = req.body;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AUTH ROUTES
+    // ═══════════════════════════════════════════════════════════════════════════
 
-      if (!user?.email) {
-        return res.status(400).send({ message: "Email is required" });
-      }
+    // Called by better-auth on server side to issue a JWT for your own API
+    // POST /api/auth/token  →  { email } → { token }
+    // Your session.js getUserToken() returns better-auth's session token.
+    // This endpoint exchanges the user's email (after better-auth validates them)
+    // for a JWT your Express server can verify independently.
+    app.post("/api/auth/token", async (req, res) => {
+      const { email } = req.body;
+      if (!email) return res.status(400).json({ message: "Email required" });
 
-      const existingUser = await usersCollection.findOne({
-        email: user.email
-      });
+      const user = await usersCollection.findOne({ email });
+      if (!user) return res.status(404).json({ message: "User not found" });
 
-      if (!existingUser) {
+      // Sign a JWT carrying the user's role and status for use in protected routes
+      const token = jwt.sign(
+        { email: user.email, role: user.role, status: user.status },
+        JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      res.json({ token });
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // USER ROUTES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // POST /api/users/sync
+    // Called after better-auth signUp to save extra fields to your DB
+    app.post("/api/users/sync", async (req, res) => {
+      const { name, email, avatar, bloodGroup, district, upazila } = req.body;
+      if (!email) return res.status(400).json({ message: "Email is required" });
+
+      const existing = await usersCollection.findOne({ email });
+      if (!existing) {
         await usersCollection.insertOne({
-          name: user.name,
-          email: user.email,
-          avatar: user.avatar,
-          bloodGroup: user.bloodGroup,
-          district: user.district,
-          upazila: user.upazila,
-
+          name,
+          email,
+          avatar,
+          bloodGroup,
+          district,
+          upazila,
           role: "donor",
           status: "active",
-
-          createdAt: new Date()
+          createdAt: new Date(),
         });
       }
-
-      res.send({ success: true });
+      res.json({ success: true });
     });
 
-    app.get('/api/users/:id', async (req, res) => {
-      const id = req.params.id;
-
-      const user = await usersCollection.findOne({
-        _id: new ObjectId(id)
-      });
-
-      res.send(user);
+    // GET /api/users/by-email?email=xxx
+    // Used by login page to check status (blocked?) and get role
+    app.get("/api/users/by-email", async (req, res) => {
+      const { email } = req.query;
+      if (!email) return res.status(400).json({ message: "Email required" });
+      const user = await usersCollection.findOne(
+        { email },
+        { projection: { password: 0 } } // never expose password
+      );
+      if (!user) return res.status(404).json({ message: "User not found" });
+      res.json(user);
     });
 
-    // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
-    // Ensures that the client will close when you finish/error
-    await client.close();
+    // GET /api/users/:id  — get single user by MongoDB _id (for profile page)
+    app.get("/api/users/:id", verifyToken, async (req, res) => {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id))
+        return res.status(400).json({ message: "Invalid user ID" });
+      const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+      if (!user) return res.status(404).json({ message: "User not found" });
+      res.json(user);
+    });
+
+    // PATCH /api/users/profile  — update own profile (name, avatar, bloodGroup, district, upazila)
+    app.patch("/api/users/profile", verifyToken, verifyActive, async (req, res) => {
+      const { email } = req.user; // from JWT
+      const { name, avatar, bloodGroup, district, upazila } = req.body;
+      const result = await usersCollection.updateOne(
+        { email },
+        { $set: { name, avatar, bloodGroup, district, upazila } }
+      );
+      res.json({ success: true, modifiedCount: result.modifiedCount });
+    });
+
+    // GET /api/admin/users  — admin: get all users with optional status filter
+    app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+      const { status } = req.query; // "active" | "blocked" | undefined (all)
+      const filter = status ? { status } : {};
+      const users = await usersCollection.find(filter).toArray();
+      res.json(users);
+    });
+
+    // PATCH /api/admin/users/:id/status  — admin: block or unblock a user
+    
+
+    // ─── Health check ──────────────────────────────────────────────────────────
+    app.get("/", (req, res) => res.send("BloodBond API is running ✅"));
+
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
   }
 }
-run().catch(console.dir);
 
+run();
 
-app.get('/', (req, res) => {
-  res.send('Hello World!');
-});
-
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
