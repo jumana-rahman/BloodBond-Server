@@ -289,6 +289,199 @@ async function run() {
       res.json({ requests, total, page: parseInt(page), limit: parseInt(limit) });
     });
 
+    // GET /api/admin/donation-requests  — admin/volunteer: ALL requests with filter + pagination
+    app.get(
+      "/api/admin/donation-requests",
+      verifyToken,
+      verifyAdminOrVolunteer,
+      async (req, res) => {
+        const { status, page = 1, limit = 10 } = req.query;
+        const filter = status ? { status } : {};
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const [requests, total] = await Promise.all([
+          donationRequestsCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .toArray(),
+          donationRequestsCollection.countDocuments(filter),
+        ]);
+        res.json({ requests, total, page: parseInt(page), limit: parseInt(limit) });
+      }
+    );
+
+    // POST /api/donation-requests  — donor: create a new request
+    app.post(
+      "/api/donation-requests",
+      verifyToken,
+      verifyActive, // blocked users cannot create requests
+      async (req, res) => {
+        const {
+          recipientName,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
+          bloodGroup,
+          donationDate,
+          donationTime,
+          requestMessage,
+        } = req.body;
+
+        const { email } = req.user;
+
+        // Get requester's name from DB
+        const requester = await usersCollection.findOne({ email });
+
+        const newRequest = {
+          requesterName: requester?.name || "",
+          requesterEmail: email,
+          recipientName,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
+          bloodGroup,
+          donationDate,
+          donationTime,
+          requestMessage,
+          status: "pending", // always starts as pending
+          donorInfo: null, // filled when someone confirms donation
+          createdAt: new Date(),
+        };
+
+        const result = await donationRequestsCollection.insertOne(newRequest);
+        res.status(201).json({ success: true, insertedId: result.insertedId });
+      }
+    );
+
+    // PATCH /api/donation-requests/:id  — donor: edit own request fields
+    app.patch(
+      "/api/donation-requests/:id",
+      verifyToken,
+      verifyActive,
+      async (req, res) => {
+        const { id } = req.params;
+        const { email, role } = req.user;
+        if (!ObjectId.isValid(id))
+          return res.status(400).json({ message: "Invalid ID" });
+
+        const request = await donationRequestsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!request) return res.status(404).json({ message: "Not found" });
+
+        // Donors can only edit their own; admin can edit any
+        if (role === "donor" && request.requesterEmail !== email) {
+          return res.status(403).json({ message: "Forbidden" });
+        }
+
+        const {
+          recipientName,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
+          bloodGroup,
+          donationDate,
+          donationTime,
+          requestMessage,
+        } = req.body;
+
+        const result = await donationRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              recipientName,
+              recipientDistrict,
+              recipientUpazila,
+              hospitalName,
+              fullAddress,
+              bloodGroup,
+              donationDate,
+              donationTime,
+              requestMessage,
+            },
+          }
+        );
+        res.json({ success: true, modifiedCount: result.modifiedCount });
+      }
+    );
+
+    // PATCH /api/donation-requests/:id/status  — update donation status
+    // Donor: can change inprogress → done / inprogress → canceled (own requests only)
+    // Admin: can change any status on any request
+    // Volunteer: can change status only
+    app.patch(
+      "/api/donation-requests/:id/status",
+      verifyToken,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status, donorInfo } = req.body;
+        const { email, role } = req.user;
+
+        if (!ObjectId.isValid(id))
+          return res.status(400).json({ message: "Invalid ID" });
+
+        const validStatuses = ["pending", "inprogress", "done", "canceled"];
+        if (!validStatuses.includes(status))
+          return res.status(400).json({ message: "Invalid status" });
+
+        const request = await donationRequestsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!request) return res.status(404).json({ message: "Not found" });
+
+        // Donors: can only update their own AND only inprogress→done or inprogress→canceled
+        if (role === "donor") {
+          if (request.requesterEmail !== email)
+            return res.status(403).json({ message: "Forbidden" });
+          if (request.status !== "inprogress")
+            return res.status(400).json({ message: "Can only update inprogress requests" });
+          if (!["done", "canceled"].includes(status))
+            return res.status(400).json({ message: "Donors can only mark done or canceled" });
+        }
+
+        const updateData = { status };
+        // When a donor confirms donation (pending → inprogress), attach their info
+        if (status === "inprogress" && donorInfo) {
+          updateData.donorInfo = donorInfo; // { name, email }
+        }
+
+        const result = await donationRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+        res.json({ success: true, modifiedCount: result.modifiedCount });
+      }
+    );
+
+    // DELETE /api/donation-requests/:id  — donor: delete own request / admin: any
+    app.delete(
+      "/api/donation-requests/:id",
+      verifyToken,
+      verifyActive,
+      async (req, res) => {
+        const { id } = req.params;
+        const { email, role } = req.user;
+        if (!ObjectId.isValid(id))
+          return res.status(400).json({ message: "Invalid ID" });
+
+        const request = await donationRequestsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!request) return res.status(404).json({ message: "Not found" });
+
+        if (role === "donor" && request.requesterEmail !== email) {
+          return res.status(403).json({ message: "Forbidden" });
+        }
+
+        await donationRequestsCollection.deleteOne({ _id: new ObjectId(id) });
+        res.json({ success: true });
+      }
+    );
+
     
 
     // ─── Health check ──────────────────────────────────────────────────────────
