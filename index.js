@@ -182,6 +182,113 @@ async function run() {
     });
 
     // PATCH /api/admin/users/:id/status  — admin: block or unblock a user
+    app.patch(
+      "/api/admin/users/:id/status",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status } = req.body; // "active" | "blocked"
+        if (!["active", "blocked"].includes(status))
+          return res.status(400).json({ message: "Invalid status value" });
+        if (!ObjectId.isValid(id))
+          return res.status(400).json({ message: "Invalid user ID" });
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status } }
+        );
+        res.json({ success: true, modifiedCount: result.modifiedCount });
+      }
+    );
+
+    // PATCH /api/admin/users/:id/role  — admin: change user role
+    app.patch(
+      "/api/admin/users/:id/role",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { role } = req.body; // "donor" | "volunteer" | "admin"
+        if (!["donor", "volunteer", "admin"].includes(role))
+          return res.status(400).json({ message: "Invalid role value" });
+        if (!ObjectId.isValid(id))
+          return res.status(400).json({ message: "Invalid user ID" });
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role } }
+        );
+        res.json({ success: true, modifiedCount: result.modifiedCount });
+      }
+    );
+
+    // GET /api/admin/stats  — admin/volunteer dashboard stats
+    app.get(
+      "/api/admin/stats",
+      verifyToken,
+      verifyAdminOrVolunteer,
+      async (req, res) => {
+        const [totalUsers, totalRequests, totalFunding] = await Promise.all([
+          usersCollection.countDocuments({ role: "donor" }),
+          donationRequestsCollection.countDocuments(),
+          fundingsCollection
+            .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+            .toArray(),
+        ]);
+        res.json({
+          totalUsers,
+          totalRequests,
+          totalFunding: totalFunding[0]?.total || 0,
+        });
+      }
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DONATION REQUEST ROUTES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // GET /api/donation-requests  — public: only "pending" requests
+    app.get("/api/donation-requests", async (req, res) => {
+      const requests = await donationRequestsCollection
+        .find({ status: "pending" })
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(requests);
+    });
+
+    // GET /api/donation-requests/:id  — public: single request details
+    app.get("/api/donation-requests/:id", async (req, res) => {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id))
+        return res.status(400).json({ message: "Invalid ID" });
+      const request = await donationRequestsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+      if (!request) return res.status(404).json({ message: "Request not found" });
+      res.json(request);
+    });
+
+    // GET /api/my-donation-requests  — donor: own requests with filter + pagination
+    app.get("/api/my-donation-requests", verifyToken, async (req, res) => {
+      const { email } = req.user;
+      const { status, page = 1, limit = 10 } = req.query;
+
+      const filter = { requesterEmail: email };
+      if (status) filter.status = status;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const [requests, total] = await Promise.all([
+        donationRequestsCollection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray(),
+        donationRequestsCollection.countDocuments(filter),
+      ]);
+
+      res.json({ requests, total, page: parseInt(page), limit: parseInt(limit) });
+    });
+
     
 
     // ─── Health check ──────────────────────────────────────────────────────────
