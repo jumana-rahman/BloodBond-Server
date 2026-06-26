@@ -11,7 +11,11 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT;
 const uri = process.env.MONGO_DB_URI;
-const JWT_SECRET = process.env.JWT_SECRET;
+
+const logger = (req, res, next) => {
+  console.log('logger middleware logged', req.params);
+  next();
+}
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
@@ -23,47 +27,8 @@ app.use(
 );
 app.use(express.json());
 
-// ─── JWT Guard Middleware ─────────────────────────────────────────────────────
 
-// Verifies the Bearer token on every protected route
-const verifyToken = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "Unauthorized: No token provided" });
-  }
-  const token = authHeader.split(" ")[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; 
-    next();
-  } catch (err) {
-    return res.status(401).json({ message: "Unauthorized: Invalid or expired token" });
-  }
-};
 
-// Only admin can access
-const verifyAdmin = (req, res, next) => {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ message: "Forbidden: Admin access only" });
-  }
-  next();
-};
-
-// Admin or Volunteer can access
-const verifyAdminOrVolunteer = (req, res, next) => {
-  if (req.user?.role !== "admin" && req.user?.role !== "volunteer") {
-    return res.status(403).json({ message: "Forbidden: Admin or Volunteer access only" });
-  }
-  next();
-};
-
-// Blocked users cannot mutate data
-const verifyActive = (req, res, next) => {
-  if (req.user?.status === "blocked") {
-    return res.status(403).json({ message: "Your account has been blocked." });
-  }
-  next();
-};
 
 // ─── MongoDB Connection ───────────────────────────────────────────────────────
 
@@ -83,6 +48,7 @@ async function run() {
 
     const db = client.db("bloodbond_db");
     const usersCollection = db.collection("users");
+    const sessionCollection = db.collection("session");
     const donationRequestsCollection = db.collection("donationRequests");
     const fundingsCollection = db.collection("fundings");
 
@@ -95,22 +61,68 @@ async function run() {
     // Your session.js getUserToken() returns better-auth's session token.
     // This endpoint exchanges the user's email (after better-auth validates them)
     // for a JWT your Express server can verify independently.
-    app.post("/api/auth/token", async (req, res) => {
-      const { email } = req.body;
-      if (!email) return res.status(400).json({ message: "Email required" });
 
-      const user = await usersCollection.findOne({ email });
-      if (!user) return res.status(404).json({ message: "User not found" });
+    // verification
+    const verifyToken = async (req, res, next) => {
+      const authHeader = req.headers.authorization;
 
-      // Sign a JWT carrying the user's role and status for use in protected routes
-      const token = jwt.sign(
-        { email: user.email, role: user.role, status: user.status },
-        JWT_SECRET,
-        { expiresIn: "7d" }
-      );
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized: No token provided" });
+      }
 
-      res.json({ token });
-    });
+      const token = authHeader.split(" ")[1];
+
+      // Find session
+      const session = await sessionCollection.findOne({ token });
+
+      if (!session) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized: Invalid session" });
+      }
+
+      // Find user
+      const user = await usersCollection.findOne({
+        _id: session.userId,
+      });
+
+      if (!user) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized: User not found" });
+      }
+
+      req.user = user;
+
+      next();
+    };
+
+    // Only admin can access
+    const verifyAdmin = (req, res, next) => {
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Forbidden: Admin access only" });
+      }
+      next();
+    };
+
+    // Admin or Volunteer can access
+    const verifyAdminOrVolunteer = (req, res, next) => {
+      if (req.user?.role !== "admin" && req.user?.role !== "volunteer") {
+        return res.status(403).json({ message: "Forbidden: Admin or Volunteer access only" });
+      }
+      next();
+    };
+
+    // Blocked users cannot mutate data
+    const verifyActive = (req, res, next) => {
+      if (req.user?.status === "blocked") {
+        return res.status(403).json({ message: "Your account has been blocked." });
+      }
+      next();
+    };
+
 
     // ═══════════════════════════════════════════════════════════════════════════
     // USER ROUTES
