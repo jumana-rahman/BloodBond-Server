@@ -1,37 +1,28 @@
 const dns = require("dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
-const express = require("express");
-const cors = require("cors");
-const jwt = require("jsonwebtoken");
-require("dotenv").config();
+const express = require('express');
+const dotenv = require('dotenv');
+dotenv.config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const uri = process.env.MONGODB_URI;
 
 const app = express();
+const cors = require('cors');
+
 const port = process.env.PORT;
-const uri = process.env.MONGO_DB_URI;
+const DB = process.env.AUTH_DB_NAME;
 
-const logger = (req, res, next) => {
-  console.log('logger middleware logged', req.params);
-  next();
-}
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
-
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL,
-    credentials: true,
-  })
-);
+app.use(cors());
 app.use(express.json());
 
+app.get('/', (req, res) => {
+  res.send('Hello World!');
+});
 
-
-
-// ─── MongoDB Connection ───────────────────────────────────────────────────────
-
+// Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -42,484 +33,1084 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect();
-    await client.db("admin").command({ ping: 1 });
-    console.log("✅ Connected to MongoDB Atlas");
+    // Connect the client to the server	(optional starting in v4.7)
+    // await client.connect();
 
-    const db = client.db("bloodbond_db");
-    const usersCollection = db.collection("users");
-    const sessionCollection = db.collection("session");
-    const donationRequestsCollection = db.collection("donationRequests");
-    const fundingCollection = db.collection("funding");
+    const database = client.db(DB);
+    const userCollection = database.collection('user');
+    const usersCollection = database.collection('users');
+    const sessionCollection = database.collection('session');
+    const fundingCollection = database.collection('funding');
+    const donationRequestsCollection = database.collection('donationRequests');
 
-    // AUTH ROUTES
-   
+    //! verify token
 
-    // verification
     const verifyToken = async (req, res, next) => {
-      const authHeader = req.headers.authorization;
+      console.log('headers', req.headers);
 
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return res
-          .status(401)
-          .json({ message: "Unauthorized: No token provided" });
+      const authHeader = req.headers?.authorization;
+      if (!authHeader) {
+        return res.status(401).json({
+          message: 'Authentication required. Please log in.',
+          code: 'NO_TOKEN',
+        });
       }
 
-      const token = authHeader.split(" ")[1];
+      const token = authHeader.split(' ')[1];
+      if (!token) {
+        return res.status(401).json({
+          message: 'Invalid authorization format. Use Bearer token.',
+          code: 'INVALID_FORMAT',
+        });
+      }
 
-      // Find session
-      const session = await sessionCollection.findOne({ token });
+      const query = { token: token };
+      const session = await sessionCollection.findOne(query);
 
       if (!session) {
-        return res
-          .status(401)
-          .json({ message: "Unauthorized: Invalid session" });
+        return res.status(401).send({ message: 'Invalid or expired session' }); // Add this edge case
       }
 
-      // Find user
-      const user = await usersCollection.findOne({
-        _id: session.userId,
-      });
+      const userId = session.userId;
+
+      const userQuery = {
+        _id: userId,
+      };
+
+      const user = await userCollection.findOne(userQuery);
+      console.log('user of the session', user);
 
       if (!user) {
-        return res
-          .status(401)
-          .json({ message: "Unauthorized: User not found" });
+        return res.status(401).send({ message: 'User not found' }); // Add this edge case
       }
+
+      // set data in the req object
 
       req.user = user;
 
       next();
     };
 
-    // Only admin can access
-    const verifyAdmin = (req, res, next) => {
-      if (req.user?.role !== "admin") {
-        return res.status(403).json({ message: "Forbidden: Admin access only" });
-      }
-      next();
-    };
+    //! verify the role
 
-    // Admin or Volunteer can access
-    const verifyAdminOrVolunteer = (req, res, next) => {
-      if (req.user?.role !== "admin" && req.user?.role !== "volunteer") {
-        return res.status(403).json({ message: "Forbidden: Admin or Volunteer access only" });
-      }
-      next();
-    };
-
-    // Blocked users cannot mutate data
-    const verifyActive = (req, res, next) => {
-      if (req.user?.status === "blocked") {
-        return res.status(403).json({ message: "Your account has been blocked." });
-      }
-      next();
-    };
-
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // USER ROUTES
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    // POST /api/users/sync
-    // Called after better-auth signUp to save extra fields to your DB
-    app.post("/api/users/sync", async (req, res) => {
-      const { name, email, avatar, bloodGroup, district, upazila } = req.body;
-      if (!email) return res.status(400).json({ message: "Email is required" });
-
-      const existing = await usersCollection.findOne({ email });
-      if (!existing) {
-        await usersCollection.insertOne({
-          name,
-          email,
-          avatar,
-          bloodGroup,
-          district,
-          upazila,
-          role: "donor",
-          status: "active",
-          createdAt: new Date(),
+    const verifyAdmin = async (req, res, next) => {
+      if (!req.user) {
+        return res.status(401).json({
+          message: 'Authentication required before authorization check.',
+          code: 'NO_USER',
         });
       }
-      res.json({ success: true });
-    });
 
-    // GET /api/users/by-email?email=xxx
-    // Used by login page to check status (blocked?) and get role
-    app.get("/api/users/by-email", async (req, res) => {
-      const { email } = req.query;
-      if (!email) return res.status(400).json({ message: "Email required" });
-      const user = await usersCollection.findOne(
-        { email },
-        { projection: { password: 0 } } // never expose password
-      );
-      if (!user) return res.status(404).json({ message: "User not found" });
-      res.json(user);
-    });
-
-    // GET /api/users/:id  — get single user by MongoDB _id (for profile page)
-    app.get("/api/users/:id", verifyToken, async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id))
-        return res.status(400).json({ message: "Invalid user ID" });
-      const user = await usersCollection.findOne({ _id: new ObjectId(id) });
-      if (!user) return res.status(404).json({ message: "User not found" });
-      res.json(user);
-    });
-
-    // PATCH /api/users/profile  — update own profile (name, avatar, bloodGroup, district, upazila)
-    app.patch("/api/users/profile", verifyToken, verifyActive, async (req, res) => {
-      const { email } = req.user; // from JWT
-      const { name, avatar, bloodGroup, district, upazila } = req.body;
-      const result = await usersCollection.updateOne(
-        { email },
-        { $set: { name, avatar, bloodGroup, district, upazila } }
-      );
-      res.json({ success: true, modifiedCount: result.modifiedCount });
-    });
-
-    // GET /api/admin/users  — admin: get all users with optional status filter
-    app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
-      const { status } = req.query; // "active" | "blocked" | undefined (all)
-      const filter = status ? { status } : {};
-      const users = await usersCollection.find(filter).toArray();
-      res.json(users);
-    });
-
-    // PATCH /api/admin/users/:id/status  — admin: block or unblock a user
-    app.patch(
-      "/api/admin/users/:id/status",
-      verifyToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-        const { status } = req.body; // "active" | "blocked"
-        if (!["active", "blocked"].includes(status))
-          return res.status(400).json({ message: "Invalid status value" });
-        if (!ObjectId.isValid(id))
-          return res.status(400).json({ message: "Invalid user ID" });
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { status } }
-        );
-        res.json({ success: true, modifiedCount: result.modifiedCount });
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({
+          message:
+            'Admin access required. Your current role does not have permission.',
+          code: 'NOT_ADMIN',
+          userRole: req.user.role, // Helpful for debugging
+        });
       }
-    );
+      next();
+    };
 
-    // PATCH /api/admin/users/:id/role  — admin: change user role
-    app.patch(
-      "/api/admin/users/:id/role",
-      verifyToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-        const { role } = req.body; // "donor" | "volunteer" | "admin"
-        if (!["donor", "volunteer", "admin"].includes(role))
-          return res.status(400).json({ message: "Invalid role value" });
-        if (!ObjectId.isValid(id))
-          return res.status(400).json({ message: "Invalid user ID" });
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { role } }
-        );
-        res.json({ success: true, modifiedCount: result.modifiedCount });
+    // Verify Admin OR Volunteer Role
+    const verifyVolunteerOrAdmin = async (req, res, next) => {
+      if (!req.user) {
+        return res.status(401).json({
+          message: 'Authentication required before authorization check.',
+          code: 'NO_USER',
+        });
       }
-    );
 
-    // GET /api/admin/stats  — admin/volunteer dashboard stats
-    app.get(
-      "/api/admin/stats",
-      verifyToken,
-      verifyAdminOrVolunteer,
-      async (req, res) => {
-        const [totalUsers, totalRequests, totalFunding] = await Promise.all([
-          usersCollection.countDocuments({ role: "donor" }),
-          donationRequestsCollection.countDocuments(),
-          fundingsCollection
-            .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
-            .toArray(),
-        ]);
-        res.json({
-          totalUsers,
+      if (req.user.role !== 'admin' && req.user.role !== 'volunteer') {
+        return res.status(403).json({
+          message: 'Admin or Volunteer access required.',
+          code: 'NOT_ALLOWED',
+          userRole: req.user.role,
+        });
+      }
+      next();
+    };
+
+    // 1. GET TOTAL DONOR COUNT
+    //    Client calls: serverFetch("/api/users/count")
+    //    Returns:      { success, count }
+    // ─────────────────────────────────────────────
+    app.get('/api/users/count', async (req, res) => {
+      try {
+        // ✅ usersCollection  (your app's "users" — NOT BetterAuth "user")
+        const count = await usersCollection.countDocuments({ role: 'donor' });
+        res.status(200).send({ success: true, count });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+    // 1. GET TOTAL FUNDS (For Admin Dashboard Stats)
+    app.get('/api/funding/total', verifyToken, async (req, res) => {
+      try {
+        const result = await fundingCollection
+          .aggregate([
+            { $group: { _id: null, totalAmount: { $sum: '$amount' } } },
+          ])
+          .toArray();
+
+        const total = result.length > 0 ? result[0].totalAmount : 0;
+        res.status(200).send({ success: true, totalAmount: total });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+    // 3. GET TOTAL DONATION REQUEST COUNT
+    app.get('/api/donation-requests/count', async (req, res) => {
+      try {
+        const count = await donationRequestsCollection.countDocuments();
+        res.status(200).send({ success: true, count });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+
+    // ! GET STATUS BREAKDOWN (For Pie Chart) - 100% Correct Grouping
+    app.get('/api/donation-requests/status-breakdown', async (req, res) => {
+      try {
+        const results = await donationRequestsCollection
+          .aggregate([
+            {
+              $addFields: {
+                // 🟢 Step 1: Standardize "cancelled" to "canceled" BEFORE grouping
+                unifiedStatus: {
+                  $cond: {
+                    if: {
+                      $in: [
+                        '$status',
+                        ['canceled', 'cancelled', 'Canceled', 'Cancelled'],
+                      ],
+                    },
+                    then: 'canceled', 
+                    else: '$status',
+                  },
+                },
+              },
+            },
+            {
+              $group: {
+                _id: '$unifiedStatus',
+                value: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray();
+
+        // 🟢 Step 3: Capitalize the first letter for the Frontend
+        const data = results.map(item => ({
+          name: item._id.charAt(0).toUpperCase() + item._id.slice(1),
+          value: item.value,
+        }));
+
+        res.status(200).send({ success: true, data });
+      } catch (error) {
+        console.error('🔥 Status Breakdown Error:', error);
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+
+    // ─────────────────────────────────────────────
+    // 5. GET WEEKLY STATS  ← Bar Chart data
+    //    Client calls: serverFetch("/api/donation-requests/weekly-stats")
+    //    Returns:      { success, data: [{ day, count }] }
+    //    Example:      [{ day: "Mon", count: 3 }, { day: "Tue", count: 7 }]
+    // ─────────────────────────────────────────────
+    app.get('/api/donation-requests/weekly-stats', async (req, res) => {
+      try {
+        // Last 7 days window
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        sevenDaysAgo.setHours(0, 0, 0, 0); // start of that day
+
+        const results = await donationRequestsCollection
+          .aggregate([
+            {
+              // Only documents created in the last 7 days
+              $match: {
+                createdAt: { $gte: sevenDaysAgo },
+              },
+            },
+            {
+              // Group by day-of-week number (1 = Sun … 7 = Sat in MongoDB)
+              $group: {
+                _id: { $dayOfWeek: '$createdAt' },
+                count: { $sum: 1 },
+              },
+            },
+            {
+              $sort: { _id: 1 }, // Sun → Sat order
+            },
+          ])
+          .toArray();
+
+        // MongoDB $dayOfWeek:  1=Sun 2=Mon 3=Tue 4=Wed 5=Thu 6=Fri 7=Sat
+        const dayMap = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+        const data = results.map(item => ({
+          day: dayMap[item._id - 1], // convert 1-indexed to label
+          count: item.count,
+        }));
+
+        res.status(200).send({ success: true, data });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+
+    // ! Users
+
+    app.post('/api/users', async (req, res) => {
+      try {
+        console.log('🔥 USER API HIT');
+        console.log(req.body);
+        const user = req.body;
+
+        const existingUser = await usersCollection.findOne({
+          authId: user.authId,
+        });
+
+        if (existingUser) {
+          return res.status(409).send({
+            success: false,
+            message: 'User already exists',
+          });
+        }
+
+        const result = await usersCollection.insertOne(user);
+
+        res.status(201).send({
+          success: true,
+          insertedId: result.insertedId,
+          message: 'User created successfully',
+        });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+    // ! GET HOMEPAGE STATS
+    app.get('/api/stats', async (req, res) => {
+      try {
+        const totalDonors = await usersCollection.countDocuments({
+          role: 'donor',
+        });
+        const totalRequests = await donationRequestsCollection.countDocuments();
+        const totalFundingResult = await fundingCollection
+          .aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }])
+          .toArray();
+        const totalFunding = totalFundingResult[0]?.total || 0;
+
+        res.status(200).send({
+          success: true,
+          totalDonors,
           totalRequests,
-          totalFunding: totalFunding[0]?.total || 0,
+          totalFunding,
+        });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+
+    // ! GET USER BY AUTH ID (For Profile Page)
+    app.get('/api/users/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        const user = await usersCollection.findOne({ authId: id });
+
+        if (!user) {
+          return res.status(404).send({
+            success: false,
+            message: 'User not found - authId mismatch',
+          });
+        }
+
+        res.status(200).send(user);
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
         });
       }
-    );
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // DONATION REQUEST ROUTES
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    // GET /api/donation-requests  — public: only "pending" requests
-    app.get("/api/donation-requests", async (req, res) => {
-      const requests = await donationRequestsCollection
-        .find({ status: "pending" })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.json(requests);
     });
 
-    // GET /api/donation-requests/:id  — public: single request details
-    app.get("/api/donation-requests/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id))
-        return res.status(400).json({ message: "Invalid ID" });
-      const request = await donationRequestsCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      if (!request) return res.status(404).json({ message: "Request not found" });
-      res.json(request);
+    // ! 3. UPDATE USER BY AUTH ID ( for profile) conflict between user vs users
+
+    app.patch('/api/users/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const updateData = req.body;
+
+        // Prevent sensitive field changes
+        delete updateData._id;
+        delete updateData.authId;
+        delete updateData.email;
+        delete updateData.role;
+        delete updateData.status;
+
+        // ── 1. users collection থেকে email বের করো ──
+        const existingUser = await usersCollection.findOne({ authId: id });
+
+        if (!existingUser) {
+          return res
+            .status(404)
+            .send({ success: false, message: 'User not found' });
+        }
+
+        // ── 2. users collection update ──
+        const result = await usersCollection.updateOne(
+          { authId: id },
+          { $set: updateData },
+        );
+
+        if (result.matchedCount === 0) {
+          return res
+            .status(404)
+            .send({ success: false, message: 'User not found' });
+        }
+
+        // ── 3. BetterAuth user collection sync (email দিয়ে) ──
+        const authSyncData = {};
+        if (updateData.name) authSyncData.name = updateData.name;
+        if (updateData.image) authSyncData.image = updateData.image;
+
+        if (Object.keys(authSyncData).length > 0) {
+          authSyncData.updatedAt = new Date();
+          await userCollection.updateOne(
+            { email: existingUser.email },
+            { $set: authSyncData },
+          );
+        }
+
+        const updatedUser = await usersCollection.findOne({ authId: id });
+
+        res.status(200).send({
+          success: true,
+          message: 'Profile updated successfully',
+          user: updatedUser,
+        });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
     });
 
-    // GET /api/my-donation-requests  — donor: own requests with filter + pagination
-    app.get("/api/my-donation-requests", verifyToken, async (req, res) => {
-      const { email } = req.user;
-      const { status, page = 1, limit = 10 } = req.query;
+    // ! GET ALL DONATION REQUESTS (Admin & Volunteer View) WITH PAGINATION
+    app.get('/api/donation-requests/all', async (req, res) => {
+      try {
+        const { status, page = 1, limit = 10 } = req.query;
 
-      const filter = { requesterEmail: email };
-      if (status) filter.status = status;
+        // 1. Build Query - Get ALL requests, optionally filter by status
+        const query = {};
+        if (status && status !== 'all') {
+          query.status = status;
+        }
 
-      const skip = (parseInt(page) - 1) * parseInt(limit);
-      const [requests, total] = await Promise.all([
-        donationRequestsCollection
-          .find(filter)
+        // 2. Calculate Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // 3. Get total count
+        const totalRequests =
+          await donationRequestsCollection.countDocuments(query);
+
+        // 4. Fetch paginated data (Sorted by newest first)
+        const requests = await donationRequestsCollection
+          .find(query)
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(parseInt(limit))
-          .toArray(),
-        donationRequestsCollection.countDocuments(filter),
-      ]);
+          .toArray();
 
-      res.json({ requests, total, page: parseInt(page), limit: parseInt(limit) });
+        // 5. Send response with metadata
+        res.status(200).send({
+          success: true,
+          data: requests,
+          pagination: {
+            currentPage: parseInt(page),
+            totalPages: Math.ceil(totalRequests / parseInt(limit)),
+            totalRequests,
+            limit: parseInt(limit),
+          },
+        });
+      } catch (error) {
+        console.error('🔥 Error fetching all donation requests:', error);
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
     });
 
-    // GET /api/admin/donation-requests  — admin/volunteer: ALL requests with filter + pagination
-    app.get(
-      "/api/admin/donation-requests",
-      verifyToken,
-      verifyAdminOrVolunteer,
-      async (req, res) => {
-        const { status, page = 1, limit = 10 } = req.query;
-        const filter = status ? { status } : {};
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        const [requests, total] = await Promise.all([
-          donationRequestsCollection
-            .find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(parseInt(limit))
-            .toArray(),
-          donationRequestsCollection.countDocuments(filter),
-        ]);
-        res.json({ requests, total, page: parseInt(page), limit: parseInt(limit) });
-      }
-    );
+    // ! 4. CREATE DONATION REQUEST (✅ Fixed placement)
 
-    // POST /api/donation-requests  — donor: create a new request
-    app.post(
-      "/api/donation-requests",
-      verifyToken,
-      verifyActive, // blocked users cannot create requests
-      async (req, res) => {
-        const {
-          recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
-          bloodGroup,
-          donationDate,
-          donationTime,
-          requestMessage,
-        } = req.body;
+    app.post('/api/donation-requests', async (req, res) => {
+      try {
+        const requestData = req.body;
+        console.log('Donation Request Received:', requestData);
 
-        const { email } = req.user;
+        // 1. Validate required fields
+        const requiredFields = [
+          'requesterId',
+          'recipientName',
+          'recipientDistrict',
+          'recipientUpazila',
+          'hospitalName',
+          'fullAddress',
+          'bloodGroup',
+          'donationDate',
+          'donationTime',
+          'requestMessage',
+        ];
+        for (const field of requiredFields) {
+          if (!requestData[field]) {
+            return res.status(400).send({
+              success: false,
+              message: `${field} is required`,
+            });
+          }
+        }
 
-        // Get requester's name from DB
-        const requester = await usersCollection.findOne({ email });
+        // 2. Check if the requester is blocked
+        const user = await usersCollection.findOne({
+          authId: requestData.requesterId,
+        });
 
+        if (!user) {
+          return res.status(404).send({
+            success: false,
+            message: 'Requester user not found',
+          });
+        }
+
+        if (user.status === 'blocked') {
+          return res.status(403).send({
+            success: false,
+            message:
+              'Your account is blocked. You cannot create donation requests.',
+          });
+        }
+
+        // 3. Construct the new request document
         const newRequest = {
-          requesterName: requester?.name || "",
-          requesterEmail: email,
-          recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
-          bloodGroup,
-          donationDate,
-          donationTime,
-          requestMessage,
-          status: "pending", // always starts as pending
-          donorInfo: null, // filled when someone confirms donation
+          ...requestData, // ✅ This automatically includes donorName/donorEmail if they are sent
+          status: requestData.status || 'pending', // ✅ Allows 'inprogress' if sent, defaults to 'pending'
           createdAt: new Date(),
+          updatedAt: new Date(),
         };
 
+        // 4. Insert into MongoDB
         const result = await donationRequestsCollection.insertOne(newRequest);
-        res.status(201).json({ success: true, insertedId: result.insertedId });
-      }
-    );
 
-    // PATCH /api/donation-requests/:id  — donor: edit own request fields
-    app.patch(
-      "/api/donation-requests/:id",
-      verifyToken,
-      verifyActive,
-      async (req, res) => {
+        res.status(201).send({
+          success: true,
+          insertedId: result.insertedId,
+          message: 'Donation request created successfully',
+        });
+      } catch (error) {
+        console.error('🔥 Donation Request Error:', error);
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ! GET RECENT DONATION REQUESTS BY USER (For Donor Dashboard)
+
+    app.get('/api/donation-requests/recent/:userId', async (req, res) => {
+      try {
+        const { userId } = req.params;
+
+        // Query: Find all requests by this user, limit to 3, sort by newest first
+        const requests = await donationRequestsCollection
+          .find({ requesterId: userId })
+          .sort({ createdAt: -1 }) // Newest first
+          .limit(3) // Max 3 requests
+          .toArray();
+
+        res.status(200).send(requests);
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ! GET SINGLE DONATION REQUEST BY ID (For Edit Page)
+    app.get('/api/donation-requests/:id', async (req, res) => {
+      try {
         const { id } = req.params;
-        const { email, role } = req.user;
-        if (!ObjectId.isValid(id))
-          return res.status(400).json({ message: "Invalid ID" });
+
+        // Validate ID
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({
+            success: false,
+            message: 'Invalid ID format',
+          });
+        }
 
         const request = await donationRequestsCollection.findOne({
           _id: new ObjectId(id),
         });
-        if (!request) return res.status(404).json({ message: "Not found" });
 
-        // Donors can only edit their own; admin can edit any
-        if (role === "donor" && request.requesterEmail !== email) {
-          return res.status(403).json({ message: "Forbidden" });
+        if (!request) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found',
+          });
         }
 
-        const {
-          recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
-          bloodGroup,
-          donationDate,
-          donationTime,
-          requestMessage,
-        } = req.body;
+        res.status(200).send(request);
+      } catch (error) {
+        console.error('Error fetching request:', error);
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
 
+    // UPDATED BACKEND CODE
+    app.patch('/api/donation-requests/:id', async (req, res) => {
+      try {
+        const { id } = req.params; // <--- ✅ Take ID from URL
+        const { status, donorName, donorEmail, userId, role } = req.body; 
+
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .send({ success: false, message: 'Invalid ID format' });
+        }
+
+        const request = await donationRequestsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!request) {
+          return res
+            .status(404)
+            .send({ success: false, message: 'Request not found' });
+        }
+
+        // ── 🟢 CORE LOGIC FIX ──
+
+        // 1. If the status is being changed to "inprogress" (A Donor is volunteering)
+        if (status === 'inprogress') {
+
+          // ANY logged-in user can donate, EXCEPT the person who created it
+          if (request.requesterId === userId) {
+            return res.status(403).send({
+              success: false,
+              message: 'You cannot donate to your own request.',
+            });
+          }
+
+          // ✅ Allow the update
+          const updateFields = {
+            status,
+            donorName,
+            donorEmail,
+            updatedAt: new Date(),
+          };
+
+          await donationRequestsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateFields },
+          );
+
+          return res.status(200).send({
+            success: true,
+            message:
+              'Donation confirmed! You have volunteered to donate blood.',
+          });
+        }
+
+        // Perform the update for Requester/Admin changing to done/canceled
         const result = await donationRequestsCollection.updateOne(
           { _id: new ObjectId(id) },
           {
             $set: {
-              recipientName,
-              recipientDistrict,
-              recipientUpazila,
-              hospitalName,
-              fullAddress,
-              bloodGroup,
-              donationDate,
-              donationTime,
-              requestMessage,
+              status,
+              updatedAt: new Date(),
             },
-          }
+          },
         );
-        res.json({ success: true, modifiedCount: result.modifiedCount });
+
+        res.status(200).send({
+          success: true,
+          message: `Status updated to ${status}`,
+        });
+      } catch (error) {
+        console.error('🔥 PATCH Error:', error);
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
       }
-    );
+    });
 
-    // PATCH /api/donation-requests/:id/status  — update donation status
-    // Donor: can change inprogress → done / inprogress → canceled (own requests only)
-    // Admin: can change any status on any request
-    // Volunteer: can change status only
-    app.patch(
-      "/api/donation-requests/:id/status",
-      verifyToken,
-      async (req, res) => {
+    //  for deleting request
+    app.delete('/api/donation-requests/:id', async (req, res) => {
+      try {
         const { id } = req.params;
-        const { status, donorInfo } = req.body;
-        const { email, role } = req.user;
+        const { userId, role } = req.body;
 
-        if (!ObjectId.isValid(id))
-          return res.status(400).json({ message: "Invalid ID" });
-
-        const validStatuses = ["pending", "inprogress", "done", "canceled"];
-        if (!validStatuses.includes(status))
-          return res.status(400).json({ message: "Invalid status" });
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({
+            success: false,
+            message: 'Invalid ID format',
+          });
+        }
 
         const request = await donationRequestsCollection.findOne({
           _id: new ObjectId(id),
         });
-        if (!request) return res.status(404).json({ message: "Not found" });
 
-        // Donors: can only update their own AND only inprogress→done or inprogress→canceled
-        if (role === "donor") {
-          if (request.requesterEmail !== email)
-            return res.status(403).json({ message: "Forbidden" });
-          if (request.status !== "inprogress")
-            return res.status(400).json({ message: "Can only update inprogress requests" });
-          if (!["done", "canceled"].includes(status))
-            return res.status(400).json({ message: "Donors can only mark done or canceled" });
+        if (!request) {
+          return res.status(404).send({
+            success: false,
+            message: 'Request not found',
+          });
         }
 
-        const updateData = { status };
-        // When a donor confirms donation (pending → inprogress), attach their info
-        if (status === "inprogress" && donorInfo) {
-          updateData.donorInfo = donorInfo; // { name, email }
+        // Owner or Admin only
+        if (request.requesterId !== userId && role !== 'admin') {
+          return res.status(403).send({
+            success: false,
+            message: 'You are not authorized to delete this request',
+          });
         }
 
-        const result = await donationRequestsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: updateData }
-        );
-        res.json({ success: true, modifiedCount: result.modifiedCount });
+        const result = await donationRequestsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.status(200).send({
+          success: true,
+          message: 'Request deleted successfully',
+        });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
       }
-    );
+    });
 
-    // DELETE /api/donation-requests/:id  — donor: delete own request / admin: any
+    // ! DELETE REQUEST (ADMIN ONLY) - No userId required
     app.delete(
-      "/api/donation-requests/:id",
+      '/api/donation-requests/admin-delete/:id',
       verifyToken,
-      verifyActive,
+      verifyAdmin,
       async (req, res) => {
-        const { id } = req.params;
-        const { email, role } = req.user;
-        if (!ObjectId.isValid(id))
-          return res.status(400).json({ message: "Invalid ID" });
+        try {
+          const { id } = req.params;
+          const { role } = req.body; 
 
-        const request = await donationRequestsCollection.findOne({
-          _id: new ObjectId(id),
-        });
-        if (!request) return res.status(404).json({ message: "Not found" });
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+              success: false,
+              message: 'Invalid ID format',
+            });
+          }
 
-        if (role === "donor" && request.requesterEmail !== email) {
-          return res.status(403).json({ message: "Forbidden" });
+          // Ensure the person deleting is an admin
+          if (role !== 'admin') {
+            return res.status(403).send({
+              success: false,
+              message: 'You are not authorized to delete this request',
+            });
+          }
+
+          const request = await donationRequestsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!request) {
+            return res.status(404).send({
+              success: false,
+              message: 'Request not found',
+            });
+          }
+
+          const result = await donationRequestsCollection.deleteOne({
+            _id: new ObjectId(id),
+          });
+
+          res.status(200).send({
+            success: true,
+            message: 'Request deleted successfully',
+          });
+        } catch (error) {
+          console.error('🔥 Admin Delete Error:', error);
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
         }
-
-        await donationRequestsCollection.deleteOne({ _id: new ObjectId(id) });
-        res.json({ success: true });
-      }
+      },
     );
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SEARCH ROUTES  (public)
-    // ═══════════════════════════════════════════════════════════════════════════
+    //  EDIT  donation request
+    app.put(
+      '/api/donation-requests/edit/:id',
+      verifyToken,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { userId, role, ...updateData } = req.body;
 
-    // GET /api/search/donors?bloodGroup=A+&district=Dhaka&upazila=Dhanmondi
-    app.get("/api/search/donors", async (req, res) => {
-      const { bloodGroup, district, upazila } = req.query;
-      const filter = { role: "donor", status: "active" };
-      if (bloodGroup) filter.bloodGroup = bloodGroup;
-      if (district) filter.district = district;
-      if (upazila) filter.upazila = upazila;
-      const donors = await usersCollection
-        .find(filter, {
-          projection: { name: 1, email: 1, avatar: 1, bloodGroup: 1, district: 1, upazila: 1 },
-        })
-        .toArray();
-      res.json(donors);
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+              success: false,
+              message: 'Invalid ID format',
+            });
+          }
+
+          const request = await donationRequestsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!request) {
+            return res.status(404).send({
+              success: false,
+              message: 'Request not found',
+            });
+          }
+
+          // Owner or Admin only
+          if (request.requesterId !== userId && role !== 'admin') {
+            return res.status(403).send({
+              success: false,
+              message: 'You are not authorized to edit this request',
+            });
+          }
+
+          // Prevent editing if already done or canceled
+          if (request.status === 'done' || request.status === 'canceled') {
+            return res.status(400).send({
+              success: false,
+              message: `Cannot edit a request that is already ${request.status}`,
+            });
+          }
+
+          const result = await donationRequestsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                ...updateData,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.status(200).send({
+            success: true,
+            message: 'Request updated successfully',
+          });
+        } catch (error) {
+          console.error('Edit request error:', error);
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // ! GET ALL DONATION REQUESTS BY USER (With Filter & Pagination)
+
+    app.get('/api/donation-requests/my-requests/:userId', async (req, res) => {
+      try {
+        const { userId } = req.params;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        // 1. Build the MongoDB Query
+        const query = { requesterId: userId };
+        if (status && status !== 'all') {
+          query.status = status;
+        }
+
+        // 2. Calculate Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // 3. Get the total count (for pagination metadata)
+        const totalRequests =
+          await donationRequestsCollection.countDocuments(query);
+
+        // 4. Fetch the paginated data
+        const requests = await donationRequestsCollection
+          .find(query)
+          .sort({ createdAt: -1 }) // Newest first
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        // 5. Send response with metadata
+        res.status(200).send({
+          success: true,
+          data: requests,
+          pagination: {
+            currentPage: parseInt(page),
+            totalPages: Math.ceil(totalRequests / parseInt(limit)),
+            totalRequests,
+            limit: parseInt(limit),
+          },
+        });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // FUNDING ROUTES
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ! GET ALL PENDING DONATION REQUESTS (Public Page)
 
-    // GET /api/fundings  — private: show all fundings
-    app.get("/api/fundings", verifyToken, async (req, res) => {
-      const fundings = await fundingsCollection
-        .find()
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.json(fundings);
+    app.get('/api/donation-requests', async (req, res) => {
+      try {
+        const requests = await donationRequestsCollection
+          .find({ status: 'pending' })
+          .sort({ createdAt: -1 }) // Newest first
+          .toArray();
+
+        res.status(200).send(requests);
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
     });
 
-    // POST /api/fundings  — save a completed Stripe payment record
+    // ! GET SINGLE DONATION REQUEST BY ID (For Details Page)
+
+    app.get(
+      '/api/donation-requests/:id',
+      verifyToken,
+
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          let objectId;
+          try {
+            // ✅ Wrap the ObjectId creation in a try/catch block
+            objectId = new ObjectId(id);
+          } catch (err) {
+            // If the ID string is invalid for MongoDB, return 404 (Not Found)
+            return res.status(404).send({
+              success: false,
+              message: 'Request not found',
+            });
+          }
+
+          const request = await donationRequestsCollection.findOne({
+            _id: objectId,
+          });
+
+          if (!request) {
+            return res.status(404).send({
+              success: false,
+              message: 'Request not found',
+            });
+          }
+
+          res.status(200).send(request);
+        } catch (error) {
+          console.error('Error fetching request:', error);
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // ! GET DONORS BY SEARCH (Public Search Page)
+    app.get('/api/donors/search', async (req, res) => {
+      try {
+        const { bloodGroup, district, upazila } = req.query;
+
+        // 1. Build dynamic filter query
+        const filter = {};
+
+        if (bloodGroup && bloodGroup !== 'all') {
+          filter.bloodGroup = bloodGroup;
+        }
+
+        // ⚠️ CHANGE: Search by ID instead of Name (Your users store "district": "47")
+        if (district && district !== 'all') {
+          filter.district = district;
+        }
+
+        // ⚠️ CHANGE: Search by ID instead of Name
+        if (upazila && upazila !== 'all') {
+          filter.upazila = upazila;
+        }
+
+        // 2. Only show active donors (not blocked)
+        filter.status = { $ne: 'blocked' };
+
+        console.log('🔍 Search Query:', filter);
+
+        // 3. Query MongoDB
+        const donors = await usersCollection.find(filter).limit(50).toArray();
+
+        // 4. Return the list
+        res.status(200).send({
+          success: true,
+          count: donors.length,
+          data: donors,
+        });
+      } catch (error) {
+        console.error('🔥 Donor Search Error:', error);
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ! GET ALL USERS (Admin Only) with Pagination & Filter
+
+    app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { status, page = 1, limit = 10 } = req.query;
+
+        // 1. Build the MongoDB Query
+        const query = {};
+        if (status && status !== 'all') {
+          query.status = status;
+        }
+
+        // 2. Calculate Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // 3. Get total count
+        const totalUsers = await usersCollection.countDocuments(query);
+
+        // 4. Fetch paginated users (exclude sensitive fields like password if present)
+        const users = await usersCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        res.status(200).send({
+          success: true,
+          data: users,
+          pagination: {
+            currentPage: parseInt(page),
+            totalPages: Math.ceil(totalUsers / parseInt(limit)),
+            totalUsers,
+            limit: parseInt(limit),
+          },
+        });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ! UPDATE USER STATUS / ROLE (Admin Only) - Using Better Auth API
+    app.patch(
+      '/api/admin/users/:id',
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params; // authId
+          const { action } = req.body;
+
+          console.log('🚀 Admin Action Received:', { authId: id, action });
+
+          if (!action) {
+            return res
+              .status(400)
+              .send({ success: false, message: 'Action is required' });
+          }
+
+        //  Determine the update based on the action
+          let updateFields = {};
+
+          if (action === 'block') {
+            updateFields = { status: 'blocked' };
+          } else if (action === 'unblock') {
+            updateFields = { status: 'active' };
+          } else if (action === 'makeVolunteer') {
+            updateFields = { role: 'volunteer' };
+          } else if (action === 'makeAdmin') {
+            updateFields = { role: 'admin' };
+          } else {
+            return res
+              .status(400)
+              .send({ success: false, message: 'Invalid action provided' });
+          }
+
+          // Update the 'users' collection (Your custom app data)
+          const usersUpdateResult = await usersCollection.updateOne(
+            { authId: id },
+            {
+              $set: updateFields,
+              $unset: { action: '' },
+            },
+          );
+
+          if (usersUpdateResult.matchedCount === 0) {
+            return res.status(404).send({
+              success: false,
+              message: "User not found in 'users' collection",
+            });
+          }
+          console.log("✅ 'users' collection updated.");
+
+          const appUser = await usersCollection.findOne({ authId: id });
+          if (appUser) {
+            await userCollection.updateOne(
+              { email: appUser.email },
+              { $set: updateFields },
+            );
+            console.log("✅ 'user' (Better Auth) collection updated.");
+          } else {
+            console.warn("⚠️ User not found in Better Auth 'user' collection.");
+          }
+          const successMessage =
+            action === 'block'
+              ? 'blocked'
+              : action === 'unblock'
+                ? 'unblocked'
+                : action === 'makeVolunteer'
+                  ? 'made a volunteer'
+                  : 'made an admin';
+
+          res.status(200).send({
+            success: true,
+            message: `User ${successMessage} successfully!`,
+          });
+        } catch (error) {
+          console.error('🔥 Admin PATCH Error:', error);
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // ! ==========================================
+    // ! FUNDING & STRIPE ROUTES
+    // ! ==========================================
+
     app.get('/api/funding', async (req, res) => {
       try {
         const fundingData = await fundingCollection
@@ -554,8 +1145,7 @@ async function run() {
       }
     });
 
-    // POST /api/create-payment-intent  — Stripe: create payment intent
-    // (install: npm install stripe)
+    // 3. CREATE STRIPE PAYMENT INTENT
     app.post('/api/funding/create-payment-intent', async (req, res) => {
       try {
         const { amount } = req.body; // Amount is in cents
@@ -573,6 +1163,7 @@ async function run() {
       }
     });
 
+    // 4. SAVE FUNDING TO DATABASE
     app.post('/api/funding', async (req, res) => {
       try {
         const { userId, amount, paymentId } = req.body;
@@ -602,14 +1193,18 @@ async function run() {
       }
     });
 
-    // ─── Health check ──────────────────────────────────────────────────────────
-    app.get("/", (req, res) => res.send("BloodBond API is running ✅"));
-
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
+    // Send a ping to confirm a successful connection
+    // await client.db("admin").command({ ping: 1 });
+    console.log(
+      'Pinged your deployment. You successfully connected to MongoDB!',
+    );
+  } finally {
+    // Ensures that the client will close when you finish/error
+    // await client.close();
   }
 }
+run().catch(console.dir);
 
-run();
-
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+app.listen(port, () => {
+  console.log(`Example app listening on port ${port}`);
+});
