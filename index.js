@@ -47,20 +47,13 @@ async function run() {
     console.log("✅ Connected to MongoDB Atlas");
 
     const db = client.db("bloodbond_db");
-    const usersCollection = db.collection("user");
+    const usersCollection = db.collection("users");
     const sessionCollection = db.collection("session");
     const donationRequestsCollection = db.collection("donationRequests");
-    const fundingsCollection = db.collection("fundings");
+    const fundingCollection = db.collection("funding");
 
-    // ═══════════════════════════════════════════════════════════════════════════
     // AUTH ROUTES
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    // Called by better-auth on server side to issue a JWT for your own API
-    // POST /api/auth/token  →  { email } → { token }
-    // Your session.js getUserToken() returns better-auth's session token.
-    // This endpoint exchanges the user's email (after better-auth validates them)
-    // for a JWT your Express server can verify independently.
+   
 
     // verification
     const verifyToken = async (req, res, next) => {
@@ -527,37 +520,85 @@ async function run() {
     });
 
     // POST /api/fundings  — save a completed Stripe payment record
-    app.post("/api/fundings", verifyToken, verifyActive, async (req, res) => {
-      const { amount, transactionId } = req.body;
-      const { email } = req.user;
-      const donor = await usersCollection.findOne({ email });
-      const funding = {
-        donorName: donor?.name || "",
-        donorEmail: email,
-        amount: parseFloat(amount),
-        transactionId,
-        createdAt: new Date(),
-      };
-      const result = await fundingsCollection.insertOne(funding);
-      res.status(201).json({ success: true, insertedId: result.insertedId });
+    app.get('/api/funding', async (req, res) => {
+      try {
+        const fundingData = await fundingCollection
+          .aggregate([
+            {
+              $lookup: {
+                from: 'users',
+                localField: 'userId',
+                foreignField: 'authId',
+                as: 'donorInfo',
+              },
+            },
+            {
+              $unwind: { path: '$donorInfo', preserveNullAndEmptyArrays: true },
+            },
+            {
+              $project: {
+                donorName: '$donorInfo.name',
+                donorEmail: '$donorInfo.email',
+                amount: 1,
+                createdAt: 1,
+                paymentId: 1,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+          ])
+          .toArray();
+
+        res.status(200).send({ success: true, data: fundingData });
+      } catch (error) {
+        res.status(500).send({ success: false, message: error.message });
+      }
     });
 
     // POST /api/create-payment-intent  — Stripe: create payment intent
     // (install: npm install stripe)
-    app.post("/api/create-payment-intent", verifyToken, verifyActive, async (req, res) => {
-      const { amount } = req.body; // amount in BDT (or any currency)
-      if (!amount || amount < 1)
-        return res.status(400).json({ message: "Invalid amount" });
+    app.post('/api/funding/create-payment-intent', async (req, res) => {
       try {
-        const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+        const { amount } = req.body; // Amount is in cents
+
         const paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(amount * 100), // convert to cents/paisa
-          currency: "usd", // change to "bdt" if Stripe supports it in your region
-          payment_method_types: ["card"],
+          amount: parseInt(amount),
+          currency: 'usd',
+          automatic_payment_methods: { enabled: true },
         });
-        res.json({ clientSecret: paymentIntent.client_secret });
-      } catch (err) {
-        res.status(500).json({ message: err.message });
+
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        console.error('🔥 Stripe Error:', error);
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    app.post('/api/funding', async (req, res) => {
+      try {
+        const { userId, amount, paymentId } = req.body;
+
+        if (!userId || !amount || !paymentId) {
+          return res
+            .status(400)
+            .send({ success: false, message: 'Missing required fields' });
+        }
+
+        const newFunding = {
+          userId: userId,
+          amount: parseFloat(amount),
+          paymentId: paymentId,
+          createdAt: new Date(),
+        };
+
+        await fundingCollection.insertOne(newFunding);
+
+        res.status(201).send({
+          success: true,
+          message: 'Funding saved successfully!',
+        });
+      } catch (error) {
+        console.error('🔥 Funding Save Error:', error);
+        res.status(500).send({ success: false, message: error.message });
       }
     });
 
