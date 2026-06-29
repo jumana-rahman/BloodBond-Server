@@ -47,7 +47,7 @@ async function run() {
     console.log("✅ Connected to MongoDB Atlas");
 
     const db = client.db("bloodbond_db");
-    const usersCollection = db.collection("users");
+    const usersCollection = db.collection("user");
     const sessionCollection = db.collection("session");
     const donationRequestsCollection = db.collection("donationRequests");
     const fundingsCollection = db.collection("fundings");
